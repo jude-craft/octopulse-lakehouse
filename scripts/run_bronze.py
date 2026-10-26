@@ -16,7 +16,7 @@ from ghpipe.bronze import process_bronze
 RAW_DIR = "data/raw/m0_sample"
 BRONZE_OUT = "data/bronze/events"
 QUARANTINE_OUT = "data/quarantine"
-DEV_SLICE = True 
+DEV_SLICE = False 
 
 def files_per_day(raw_dir:str) -> Counter:
     """Count hourly files per UTC date, based on the filename."""
