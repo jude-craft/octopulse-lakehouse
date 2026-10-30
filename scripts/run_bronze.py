@@ -1,6 +1,7 @@
 import logging
 import re
 import sys
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -13,7 +14,7 @@ from ghpipe.bronze import process_bronze
 
 
 # ---- Settings ----
-RAW_DIR = "data/raw/m0_sample"
+RAW_DIR = "data/raw/gharchive"
 BRONZE_OUT = "data/bronze/events"
 QUARANTINE_OUT = "data/quarantine"
 DEV_SLICE = False 
@@ -44,30 +45,30 @@ def guard_partial_days(raw_dir:str, dev_slice:bool) -> None:
                 f"{day}: {n}/24 hourly files present. Refusing to overwrite that date's partition."
             )
             
-if __name__ == "__main__": # Only run the code below if I am executing this file directly from the terminal.
+if __name__ == "__main__":
     guard_partial_days(RAW_DIR, DEV_SLICE)
-    
+    days = sorted(files_per_day(RAW_DIR))
+
     spark = (
         SparkSession.builder
         .appName("octopulse-bronze")
-        .master("local[*]")
-        .config("spark.driver.memory", "4g")
+        .master("local[4]")                      # cap concurrent file parsing; raise if RAM allows
+        .config("spark.driver.memory", "6g")     # check `free -h` first
         .config("spark.sql.session.timeZone", "UTC")
         .config("spark.sql.sources.partitionOverwriteMode", "dynamic")
         .getOrCreate()
     )
     spark.sparkContext.setLogLevel("WARN")
-    
+
     try:
-        logging.info("Starting Bronze Processing...")
-        results = process_bronze(spark, RAW_DIR, BRONZE_OUT, QUARANTINE_OUT)
-        
-        total = results["in_scope"] + results["out_of_scope"] + results["corrupt"]
-        logging.info("--- Final Results ---")
-        logging.info(f"Dates processed:     {results["dates"]}")
-        logging.info(f"Total raw rows:       {total:,}")
-        logging.info(f"In scope written:     {results['in_scope']:,}")
-        logging.info(f"Out of scope skipped: {results['out_of_scope']:,}")
-        logging.info(f"Corrupt quarantined:  {results['corrupt']:,}")
+        t_all = time.time()
+        for day in days:
+            t0 = time.time()
+            r = process_bronze(spark, f"{RAW_DIR}/{day}-*.json.gz", BRONZE_OUT, QUARANTINE_OUT)
+            total = r["in_scope"] + r["out_of_scope"] + r["corrupt"]
+            logging.info("%s raw=%s in_scope=%s out_of_scope=%s corrupt=%s time=%.0fs",
+                         day, f"{total:,}", f"{r['in_scope']:,}",
+                         f"{r['out_of_scope']:,}", f"{r['corrupt']:,}", time.time() - t0)
+        logging.info("All days done in %.0fs", time.time() - t_all)
     finally:
         spark.stop()
