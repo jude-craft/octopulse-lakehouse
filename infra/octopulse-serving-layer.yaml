@@ -1,0 +1,250 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  Octopulse serving layer. A private S3 bucket for curated Gold Parquet, an Athena workgroup
+  with a hard per-query scan limit, and a Glue database with the five Gold tables.
+  No always-on resources: everything is pay-per-request, so an idle stack costs cents.
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Globally unique S3 bucket name (lowercase letters, digits, hyphens).
+    AllowedPattern: "^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$"
+  DatabaseName:
+    Type: String
+    Default: octopulse_iac
+    AllowedPattern: "^[a-z0-9_]{1,64}$"
+  WorkGroupName:
+    Type: String
+    Default: octopulse-iac
+  ScanLimitBytes:
+    Type: Number
+    Default: 1073741824
+    MinValue: 10000000
+    Description: Athena cancels any single query that would scan more than this (default 1 GiB).
+  ResultsRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    Description: Athena query results older than this are deleted automatically.
+  ProjectTag:
+    Type: String
+    Default: octopulse
+    Description: Value of the Project tag, used to separate costs from other projects.
+
+Resources:
+  DataBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-athena-results
+            Status: Enabled
+            Prefix: athena-results/
+            ExpirationInDays: !Ref ResultsRetentionDays
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload:
+              DaysAfterInitiation: 7
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  AthenaWorkGroup:
+    Type: AWS::Athena::WorkGroup
+    Properties:
+      Name: !Ref WorkGroupName
+      State: ENABLED
+      RecursiveDeleteOption: true
+      WorkGroupConfiguration:
+        EnforceWorkGroupConfiguration: true
+        PublishCloudWatchMetricsEnabled: false
+        BytesScannedCutoffPerQuery: !Ref ScanLimitBytes
+        ResultConfiguration:
+          OutputLocation: !Sub "s3://${DataBucket}/athena-results/"
+      Tags:
+        - Key: Project
+          Value: !Ref ProjectTag
+
+  GlueDatabase:
+    Type: AWS::Glue::Database
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseInput:
+        Name: !Ref DatabaseName
+        Description: Octopulse Gold tables (GH Archive medallion pipeline)
+
+  RepoActivityDaily:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: repo_activity_daily
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        PartitionKeys:
+          - {Name: event_date, Type: date}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/gold/repo_activity_daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters: {serialization.format: "1"}
+          Columns:
+            - {Name: payload_era, Type: string}
+            - {Name: repo_id, Type: bigint}
+            - {Name: repo_name, Type: string}
+            - {Name: total_events, Type: bigint}
+            - {Name: push_events, Type: bigint}
+            - {Name: fork_events, Type: bigint}
+            - {Name: star_events, Type: bigint}
+            - {Name: pr_events, Type: bigint}
+            - {Name: bot_events, Type: bigint}
+            - {Name: human_events, Type: bigint}
+            - {Name: distinct_actors, Type: bigint}
+            - {Name: distinct_pushers, Type: bigint}
+            - {Name: star_events_window, Type: bigint}
+            - {Name: star_events_prior_window, Type: bigint}
+            - {Name: star_delta, Type: bigint}
+            - {Name: star_velocity, Type: double}
+            - {Name: velocity_window_days, Type: int}
+            - {Name: velocity_history_complete, Type: boolean}
+            - {Name: trending_rank, Type: int}
+
+  LanguageActivityDaily:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: language_activity_daily
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        PartitionKeys:
+          - {Name: event_date, Type: date}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/gold/language_activity_daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters: {serialization.format: "1"}
+          Columns:
+            - {Name: payload_era, Type: string}
+            - {Name: language, Type: string}
+            - {Name: active_repos, Type: bigint}
+            - {Name: pr_events, Type: bigint}
+            - {Name: pr_opened_events, Type: bigint}
+            - {Name: pr_opened_human_events, Type: bigint}
+            - {Name: distinct_contributors, Type: bigint}
+            - {Name: is_known_language, Type: boolean}
+            - {Name: share_of_pr_events, Type: double}
+            - {Name: language_coverage, Type: double}
+
+  PrHealthDaily:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: pr_health_daily
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        PartitionKeys:
+          - {Name: event_date, Type: date}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/gold/pr_health_daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters: {serialization.format: "1"}
+          Columns:
+            - {Name: payload_era, Type: string}
+            - {Name: repo_id, Type: bigint}
+            - {Name: pr_events, Type: bigint}
+            - {Name: prs_opened, Type: bigint}
+            - {Name: prs_opened_by_humans, Type: bigint}
+            - {Name: prs_merged, Type: bigint}
+            - {Name: prs_closed_unmerged, Type: bigint}
+            - {Name: prs_closed_unknown, Type: bigint}
+            - {Name: prs_closed, Type: bigint}
+            - {Name: merge_rate, Type: double}
+
+  ContributorActivityDaily:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: contributor_activity_daily
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        PartitionKeys:
+          - {Name: event_date, Type: date}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/gold/contributor_activity_daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters: {serialization.format: "1"}
+          Columns:
+            - {Name: payload_era, Type: string}
+            - {Name: actor_id, Type: bigint}
+            - {Name: actor_login, Type: string}
+            - {Name: is_bot, Type: boolean}
+            - {Name: events_total, Type: bigint}
+            - {Name: push_events, Type: bigint}
+            - {Name: pr_events, Type: bigint}
+            - {Name: repos_touched, Type: bigint}
+            - {Name: first_seen_date, Type: date}
+            - {Name: is_new_contributor, Type: boolean}
+
+  PrMergeTimeDaily:
+    Type: AWS::Glue::Table
+    Properties:
+      CatalogId: !Ref AWS::AccountId
+      DatabaseName: !Ref GlueDatabase
+      TableInput:
+        Name: pr_merge_time_daily
+        TableType: EXTERNAL_TABLE
+        Parameters: {classification: parquet, EXTERNAL: "TRUE"}
+        PartitionKeys:
+          - {Name: event_date, Type: date}
+        StorageDescriptor:
+          Location: !Sub "s3://${DataBucket}/gold/pr_merge_time_daily/"
+          InputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetInputFormat
+          OutputFormat: org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat
+          SerdeInfo:
+            SerializationLibrary: org.apache.hadoop.hive.ql.io.parquet.serde.ParquetHiveSerDe
+            Parameters: {serialization.format: "1"}
+          Columns:
+            - {Name: payload_era, Type: string}
+            - {Name: is_bot, Type: boolean}
+            - {Name: merged_prs_with_times, Type: bigint}
+            - {Name: p25_hours, Type: double}
+            - {Name: p50_hours, Type: double}
+            - {Name: p75_hours, Type: double}
+            - {Name: p90_hours, Type: double}
+
+Outputs:
+  BucketName:
+    Value: !Ref DataBucket
+  WorkGroupName:
+    Value: !Ref AthenaWorkGroup
+  DatabaseName:
+    Value: !Ref GlueDatabase
+  NextStep:
+    Value: "Copy or sync Gold into the bucket under gold/, then run MSCK REPAIR TABLE for each table."
