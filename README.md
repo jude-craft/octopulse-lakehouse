@@ -39,7 +39,7 @@ The cloud design follows one rule: **heavy compute stays local, and AWS only ser
 | Skill | Where to look |
 |---|---|
 | Medallion architecture with explicit schemas | `src/ghpipe/bronze.py`, `schemas/payloads.py` |
-| Schema evolution handled in code, not by hand | One payload schema serves both eras; `payload_era` and `merged_known` flags |
+| Schema evolution handled in code, not by hand | One payload schema serves both eras; `payload_era` and `merged_known` flags. |
 | Idempotent, day-level reprocessing | Dynamic partition overwrite, partial-day guard in `scripts/run_bronze.py` |
 | Reliable ingestion | `extract/download.py`: size check, gzip integrity check, atomic rename, retries, SQLite manifest |
 | Spark performance reasoning | Parse-before-dedup cut Silver from 2h 19m to about 19 min ([details](#performance-and-cost)) |
