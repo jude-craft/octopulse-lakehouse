@@ -7,7 +7,7 @@ The project is built around a real upstream problem: **GitHub changed its Events
 The cloud design follows one rule: **heavy compute stays local, and AWS only serves curated results**, with nothing always-on, so the whole serving layer costs cents.
 
 > **Status (v2):** Bronze, Silver and Gold are complete and verified on 8 days of data. Gold is published to S3 and queryable in Athena (validated against the local tables). A five-chart Superset dashboard sits on top. The performance study (skew and shuffle experiments) is the next step; see [Roadmap](#roadmap).
-
+![Project-Flow](docs/images/project-flow.png)
 ![Dashboard](docs/images/dashboard.jpg)
 
 ---
