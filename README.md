@@ -1,10 +1,14 @@
-# Octopulse Lakehouse: a PySpark medallion pipeline for GitHub activity
+# Octopulse Lakehouse: a PySpark medallion pipeline with an AWS serving layer
 
-A batch data pipeline that ingests hourly [GH Archive](https://www.gharchive.org/) files (public GitHub events), refines them through **Bronze → Silver → Gold** Parquet layers with PySpark, and publishes analytics tables for repository activity, language activity, pull-request health and contributor behaviour.
+A batch data pipeline that ingests hourly [GH Archive](https://www.gharchive.org/) files (public GitHub events), refines them through **Bronze → Silver → Gold** Parquet layers with PySpark, publishes the curated Gold tables to **S3**, serves them with **Athena** through a layer of SQL views, and presents them in an **Apache Superset** dashboard.
 
 The project is built around a real upstream problem: **GitHub changed its Events API payloads on 2025-10-07**, removing fields such as commit counts on pushes and the `merged` flag on pull requests. The pipeline handles both schema "eras" in one codebase and is explicit about which metrics exist in which era.
 
-> **Status:** Bronze, Silver and Gold are complete and verified on 8 days of data. The performance study (skew and shuffle experiments) and the presentation layer (charts) are the next steps; see [Roadmap](#roadmap).
+The cloud design follows one rule: **heavy compute stays local, and AWS only serves curated results**, with nothing always-on, so the whole serving layer costs cents.
+
+> **Status (v2):** Bronze, Silver and Gold are complete and verified on 8 days of data. Gold is published to S3 and queryable in Athena (validated against the local tables). A five-chart Superset dashboard sits on top. The performance study (skew and shuffle experiments) is the next step; see [Roadmap](#roadmap).
+
+![Dashboard](docs/images/dashboard.jpg)
 
 ---
 
@@ -15,16 +19,18 @@ The project is built around a real upstream problem: **GitHub changed its Events
 3. [Architecture](#architecture)
 4. [Layers in detail](#layers-in-detail)
 5. [Gold tables and metric definitions](#gold-tables-and-metric-definitions)
-6. [Findings](#findings)
-7. [Engineering decisions](#engineering-decisions)
-8. [Data quality and testing](#data-quality-and-testing)
-9. [Performance](#performance)
-10. [Run it yourself](#run-it-yourself)
-11. [Example queries](#example-queries)
-12. [Repository structure](#repository-structure)
-13. [Limitations](#limitations)
-14. [Roadmap](#roadmap)
-15. [References](#references)
+6. [Cloud serving layer](#cloud-serving-layer)
+7. [Dashboard](#dashboard)
+8. [Findings](#findings)
+9. [Engineering decisions](#engineering-decisions)
+10. [Data quality and testing](#data-quality-and-testing)
+11. [Performance and cost](#performance-and-cost)
+12. [Run it yourself](#run-it-yourself)
+13. [Example queries](#example-queries)
+14. [Repository structure](#repository-structure)
+15. [Limitations](#limitations)
+16. [Roadmap](#roadmap)
+17. [References](#references)
 
 ---
 
@@ -36,10 +42,13 @@ The project is built around a real upstream problem: **GitHub changed its Events
 | Schema evolution handled in code, not by hand | One payload schema serves both eras; `payload_era` and `merged_known` flags |
 | Idempotent, day-level reprocessing | Dynamic partition overwrite, partial-day guard in `scripts/run_bronze.py` |
 | Reliable ingestion | `extract/download.py`: size check, gzip integrity check, atomic rename, retries, SQLite manifest |
-| Spark performance reasoning | Parse-before-dedup cut Silver from 2h 19m to about 19 min ([details](#performance)) |
+| Spark performance reasoning | Parse-before-dedup cut Silver from 2h 19m to about 19 min ([details](#performance-and-cost)) |
 | Window functions done correctly | `rangeBetween` on day numbers plus a coverage calendar ([details](#engineering-decisions)) |
 | Honest metric design | NULL means "cannot know"; inferred values are flagged; limitations are documented |
-| Testing and verification | pytest with hand-written fixtures, per-layer reconciliation, `verify_*` scripts |
+| Infrastructure as code | `infra/octopulse-serving-layer.yaml` (CloudFormation, linted with `cfn-lint`) |
+| FinOps | Cost model, per-query scan limit, lifecycle rules, resource tags, nothing always-on ([details](#cost-guardrails)) |
+| Semantic layer and BI | Athena views hold metric definitions; Superset charts stay thin |
+| Testing and verification | pytest with hand-written fixtures, per-layer reconciliation, local-vs-cloud validation |
 
 ---
 
@@ -84,18 +93,18 @@ flowchart LR
     B -.-> M[("Manifest<br/>SQLite")]
     B --> C["Landing zone<br/>data/raw/gharchive<br/>immutable"]
 
-    subgraph BR["Bronze"]
+    subgraph BR["Bronze (local)"]
         D["events<br/>typed envelope +<br/>raw payload string<br/>partition: event_date"]
         Q["quarantine<br/>corrupt rows"]
     end
 
-    subgraph SI["Silver"]
+    subgraph SI["Silver (local)"]
         S1["events<br/>deduped, bot flag,<br/>no payload"]
         S2["pull_requests<br/>parsed, era-aware"]
         S3["pushes<br/>parsed, era-aware"]
     end
 
-    subgraph GO["Gold"]
+    subgraph GO["Gold (local)"]
         G1["repo_activity_daily"]
         G2["language_activity_daily"]
         G3["pr_health_daily"]
@@ -113,10 +122,20 @@ flowchart LR
     S2 --> G2
     S2 --> G3
     S2 --> G5
+
     GO --> V["Spark SQL +<br/>verify scripts"]
+    GO -->|"aws s3 sync<br/>scoped IAM user"| S3B[("S3 bucket<br/>gold/ prefix<br/>private, encrypted")]
+
+    subgraph AWS["AWS serving layer (pay per request)"]
+        S3B --> GL["Glue Data Catalog<br/>5 tables"]
+        GL --> AT["Athena workgroup<br/>per-query scan limit"]
+        AT --> VW["Athena views<br/>semantic layer"]
+    end
+
+    VW --> SS["Apache Superset<br/>local, Docker"]
 ```
 
-Note: `silver/pushes` is built and tested, but no Gold table uses it yet.
+Notes: `silver/pushes` is built and tested, but no Gold table uses it yet. Raw, Bronze and Silver never leave the local machine.
 
 ---
 
@@ -205,6 +224,94 @@ All tables are Parquet, partitioned by `event_date`, and carry `payload_era`.
 
 ---
 
+## Cloud serving layer
+
+### Flow
+
+1. **Publish:** `aws s3 sync` copies the five Gold tables (Parquet, partitioned by `event_date`) to `s3://<bucket>/gold/`. Only curated output is uploaded; raw, Bronze and Silver stay local.
+2. **Catalog:** five Glue tables (external, Parquet, partitioned by `event_date`) are defined as code in `infra/octopulse-serving-layer.yaml`. Partitions are registered with `MSCK REPAIR TABLE`.
+3. **Query:** an Athena workgroup with a hard per-query scan limit and an enforced results location.
+4. **Semantic layer:** Athena **views** (`sql/athena_views.sql`) hold the metric definitions, so dashboards cannot recompute a metric differently.
+5. **Present:** Superset datasets point at the views.
+
+Published Gold footprint: **5 tables, 93 objects, 206.6 MiB**. A `sync --dryrun` against the local folder reports no differences, and Athena row counts and the weekday-matched comparison query match the local tables.
+
+### Athena views (semantic layer)
+
+| View | Grain | Purpose |
+|---|---|---|
+| `v_daily_overview` | day | Event totals, bot share, weekday number |
+| `v_matched_weekdays` | day (Wed/Thu only) | Weekday-matched cross-era comparison |
+| `v_merge_time_daily` | day × actor type | Merge-time percentiles in seconds |
+| `v_pr_outcomes_daily` | day | Opened, merged, closed-unmerged, merge rate, inferred flag |
+| `v_language_human_prs` | day × language | Human-opened PRs by language, with coverage |
+| `v_bot_concentration` | day | Bot share of actors vs. bot share of events |
+
+Athena (Trino) differs from Spark SQL: `day_of_week` is ISO (1 = Monday), date formats use `%a`, and integer division truncates, so ratios cast to `double`.
+
+### Infrastructure as code
+
+`infra/octopulse-serving-layer.yaml` creates a private, encrypted S3 bucket with lifecycle rules, an Athena workgroup with an enforced scan limit, a Glue database and the five tables. It creates no IAM resources, takes parameters for every name (so a rebuild can run beside the existing setup) and tags resources with `Project`. The template passes `cfn-lint`, and the serving layer was rebuilt from it side by side as a rehearsal.
+
+**Runbook**
+
+1. Create a stack from the template with a new bucket name.
+2. Copy Gold bucket to bucket (CloudShell): `aws s3 sync s3://<old>/gold s3://<new>/gold`.
+3. In Athena, switch to the new workgroup and database, then `MSCK REPAIR TABLE` for each table.
+4. Re-run the validation queries and compare with the local counts.
+5. Tear down: `aws s3 rm s3://<new> --recursive`, then delete the stack (CloudFormation cannot delete a non-empty bucket).
+
+### Cost guardrails
+
+| Guardrail | Effect |
+|---|---|
+| Nothing always-on | S3, Glue catalog and Athena bill per request or per byte; no clusters, instances or managed orchestrators |
+| Per-query scan limit (template default 1 GiB) | A runaway query is cancelled instead of scanning everything |
+| Lifecycle rules | Query results expire after 7 days; abandoned multipart uploads are aborted |
+| Private bucket, default encryption | Block Public Access on; no public egress |
+| Scoped uploader IAM user | List and read/write only under the `gold/` and `silver/` prefixes; no access to the rest of the account |
+| Credentials | Stored in the local AWS CLI profile only, never in the repository |
+| Budget alerts and `Project` tags | Spend is visible and attributable per project |
+| Disposable by design | Everything is rebuildable from the template, so a lapsed AWS plan does not lose the project |
+
+### Cost model
+
+Prices are US East (N. Virginia) list prices at the time of writing; see [References](#references).
+
+| Item | Price | This project |
+|---|---|---|
+| S3 Standard storage | $0.023 per GB-month | 206.6 MiB is about $0.005 per month |
+| S3 PUT requests | $0.005 per 1,000 | A full republish is about 93 objects, which rounds to zero |
+| Data into S3 | Free | Uploads cost nothing |
+| Athena queries | $5 per TB scanned, 10 MB minimum per query, no free tier | At least $0.00005 per query; a 100 MB scan is $0.0005 |
+| Glue Data Catalog | Free up to 1 million objects and 1 million requests per month | Five tables |
+
+Compare this with the always-on alternatives deliberately **not** used: managed Airflow, a Redshift or RDS instance, or an EMR cluster.
+
+| Measured values | |
+|---|---|
+| Athena data scanned per validation query | TODO (read from the Athena console) |
+
+---
+
+## Dashboard
+
+A five-chart Apache Superset dashboard runs locally (Docker Compose) and queries the Athena views. Every chart is a thin view over a view: no metric is defined in a chart.
+
+| Chart | View | What it shows |
+|---|---|---|
+| Bot share of events, Wed/Thu only | `v_matched_weekdays` | Share of events from bot-flagged accounts, weekday-matched across eras |
+| Median time to merge | `v_merge_time_daily` | Per-day median merge time in seconds (log scale), human vs. bot, Era A only |
+| Daily PR outcomes | `v_pr_outcomes_daily` | Merged vs. closed-unmerged PRs per day (Era B unmerged is inferred) |
+| Languages of human-opened PRs | `v_language_human_prs` | Most active languages in Era A, excluding unknown-language PRs |
+| Bot concentration | `v_bot_concentration` | Bots are about 0.25% of actors but about 28% of events in Era A |
+
+Reading notes: the Era B bars in the outcomes chart come from 13 months later and are not a continuation of the Era A trend; bot share is a lower bound; language data exists only in Era A and covers about 90% of PR events.
+
+The dashboard definition is exported to `dashboards/` for reproducibility. Superset connects to Athena with PyAthena (SQLAlchemy URI `awsathena+rest://...`); credentials are entered in the Superset connection form and never committed.
+
+---
+
 ## Findings
 
 All numbers come from the verification scripts on the 8 loaded days. Treat cross-era comparisons as **observations**: the eras are 13 months apart and also differ in schema.
@@ -232,12 +339,12 @@ The ratio is about 2.0x on Wednesday and 1.9x on Thursday. Across all loaded day
 
 - **Merges by bots:** 23.8–28.6% of merged PRs in Era A are closed by bot-flagged accounts, with a median merge time of **4 seconds**.
 - **Human merge time (Era A):** weekday median 5–7 minutes, p75 7–11 hours, p90 65–72 hours. Weekend median is about 1.4–1.6 minutes with p75 about 1.1–1.3 hours. A likely explanation (not proven) is that weekday PRs wait for review while weekend merges are mostly quick solo work.
-- **A metric that misled:** an early per-repo "median of medians" gave about 1 minute; the PR-level table shows a human weekday median several times higher. Aggregating medians across tiny repos is not meaningful.
+- **A metric that misled:** an early per-repo "median of medians" gave about 1 minute, and averaging daily medians across weekdays and weekends is similarly misleading. The PR-level table, shown per day, is the right grain.
 - **Merge rate:** 76.6–80.4% in Era A; 92.0–92.5% in Era B. Do **not** compare these: per day, Era B has about 78% fewer unmerged closes than Era A but only about 25% fewer merges, which suggests either a real behaviour change or incomplete `closed` events in Era B.
 
 ### 4. Language activity (Era A only)
 
-Coverage is 88–92% of PR events (lower on the weekend). By PR events, TypeScript leads (about 17–18%), then Python (about 13%) and JavaScript (about 9–10%). These counts include bot PRs; use `pr_opened_human_events` for a human-only view. Era B has no language data, so the table holds only an `UNKNOWN` bucket for those days.
+Coverage is 88–92% of PR events (lower on the weekend). By PR events, TypeScript leads (about 17–18%), then Python (about 13%) and JavaScript (about 9–10%). For **human-opened** PRs the order is similar (TypeScript, Python, JavaScript, HTML), and HTML ranking fourth deserves a closer look, since it may reflect template or classroom repositories or automation the bot flag misses. Era B has no language data, so the table holds only an `UNKNOWN` bucket for those days.
 
 ### 5. Trending repositories
 
@@ -265,6 +372,16 @@ Day-over-day star velocity surfaces real spikes (for example, 166 stars against 
 | Gold marts | Each mart owns its own metrics; no joins between marts | Avoids a large join over a heavy-tailed key |
 | Lookback | Gold reads extra history, computes, then writes only the requested date range | Rolling metrics stay correct without overwriting other partitions |
 | Verification | Reconcile each layer; read back what was written | Counts are checked against the previous layer before a run may finish |
+| Where compute runs | **Locally**; AWS only serves curated Gold | Compute is where cloud money goes; the laptop is free and the pipeline is already tuned for it |
+| Raw data in S3 | **Never** | Public and re-downloadable; avoids slow multi-GB uploads and storage cost |
+| Writing to S3 | Local write, then `aws s3 sync` (no direct `s3://` writes from Spark) | S3 has no atomic rename, so Spark's overwrite commit is slow and fragile; sync is simple and resumable |
+| `sync --delete` | Always, per publish | Spark part-file names are random; without it a rerun leaves old and new files together and Athena double-counts. When syncing a single day, sync that partition prefix only |
+| Uploader identity | IAM user restricted to the `gold/` and `silver/` prefixes | Limits the damage of a leaked key |
+| Partition registration | `MSCK REPAIR TABLE`, not partition projection | With 8 partitions across a 13-month gap, a projected date range would probe hundreds of empty prefixes (a rough estimate puts the S3 list requests above the cost of the scan). Revisit when dates are contiguous |
+| Catalog | Tables created from DDL/IaC, no crawlers | Athena does not charge for DDL, while crawlers bill a 10-minute minimum per run |
+| Metric definitions | In Athena views, not in charts | One definition per metric; charts stay thin |
+| BI tool | Superset against Athena, run locally | A governed SQL layer behind a real BI tool; no hosting cost |
+| Rebuild proof | Side-by-side rehearsal from the template | Proves recoverability without touching the working setup |
 
 ---
 
@@ -284,12 +401,14 @@ Day-over-day star velocity surfaces real spikes (for example, 166 stars against 
 | PR payload parse failures | 0 |
 | Gold grain uniqueness | All five tables unique on their keys |
 | Gold vs Silver reconciliation | Passed; human + bot merge counts equal `prs_merged` on every Era A day |
+| Local vs S3 | `sync --dryrun` reports no differences; no `_SUCCESS` or `.crc` files uploaded |
+| Local vs Athena | Row counts for all five tables and the weekday-matched comparison match the local results |
 
-**Tests** (`uv run pytest`): hand-written fixtures covering hour-key generation, gzip truncation detection, the manifest, Bronze counting/quarantine/idempotency/filename-based dates, Silver dedup/bot flag/PR outcomes/era flags/payload dropping, and Gold velocity (including gap days and low volume), merge-rate NULL handling, language `UNKNOWN` bucket, new-contributor flags and PR-level merge time. Tests start real Spark jobs, so the full suite takes several minutes.
+**Tests** (`uv run pytest`): hand-written fixtures covering hour-key generation, gzip truncation detection, the manifest, Bronze counting/quarantine/idempotency/filename-based dates, Silver dedup/bot flag/PR outcomes/era flags/payload dropping, and Gold velocity (including gap days and low volume), merge-rate NULL handling, language `UNKNOWN` bucket, new-contributor flags and PR-level merge time. Tests start real Spark jobs, so the full suite takes several minutes. The CloudFormation template is checked with `cfn-lint`.
 
 ---
 
-## Performance
+## Performance and cost
 
 Local mode, 4 cores, 6 GB driver memory. Each figure is a single run on a shared laptop; **run-to-run variance of up to about 2x was observed on unchanged code** (Gold: 951 s, 1,552 s and 1,972 s), so read these as orders of magnitude.
 
@@ -300,20 +419,20 @@ Local mode, 4 cores, 6 GB driver memory. Each figure is a single run on a shared
 | Silver, after | **1,137 s (about 19 min)** for 8 days (3.1–11.8x faster per day), identical row counts |
 | Gold (4–5 tables, full range) | 951–1,972 s depending on the run |
 
-| Storage (fill in with `du -sh data/*`) | Size |
+| Storage footprint | Size |
 |---|---|
-| Raw `.json.gz` (landing) | TODO |
+| Gold in S3 (Parquet) | **206.6 MiB** in 93 objects |
+| Raw `.json.gz` (landing) | TODO (`du -sh data/raw`) |
 | Bronze | TODO |
 | Silver | TODO |
-| Gold | TODO |
 
-Silver's speedup is attributed to removing the payload column from the dedup shuffle. This is consistent with the result but the shuffle sizes were not measured.
+Silver's speedup is attributed to removing the payload column from the dedup shuffle. This is consistent with the result, but the shuffle sizes were not measured. The Gold tables average about 2 MiB per file, which is small for Athena (guidance favours larger files), but at 206.6 MiB in total compaction would not change cost; it becomes worthwhile as data grows.
 
 ---
 
 ## Run it yourself
 
-**Requirements:** Java (a version supported by your PySpark release), Python, and [uv](https://docs.astral.sh/uv/). Developed against PySpark 4.x on Linux.
+**Requirements:** Java (a version supported by your PySpark release), Python, [uv](https://docs.astral.sh/uv/), and for the cloud steps the AWS CLI v2. Developed against PySpark 4.x on Linux.
 
 ```bash
 # 1. Install dependencies
@@ -336,17 +455,31 @@ uv run python scripts/verify_gold.py
 uv run pytest
 ```
 
+**Publish to AWS (optional)**
+
+```bash
+# One-time: create the bucket and an IAM user limited to the gold/ and silver/ prefixes,
+# then store its key in a local CLI profile (never in the repo):
+aws configure --profile octopulse
+
+# Preview, then publish (remove --dryrun to upload)
+aws s3 sync data/gold s3://<bucket>/gold --profile octopulse \
+  --exclude "*.crc" --exclude "_SUCCESS" --delete --dryrun
+```
+
+Then, in the Athena console, deploy `infra/octopulse-serving-layer.yaml` (or create the database and tables by hand), run `MSCK REPAIR TABLE` for each table, and run `sql/athena_views.sql` to create the views.
+
 Notes:
 - `data/` is gitignored. Raw files, Bronze, Silver and Gold all live under it.
 - Bronze and Silver accept `--days`. Gold should always run over the full range, because rolling metrics and "first seen" depend on every loaded day.
-- To add days, download them, run Bronze and Silver for those days only, then rerun Gold.
+- To add days, download them, run Bronze and Silver for those days only, rerun Gold, then republish.
 - Add logins to `config/known_bots.csv` (one per line, header `login`) to flag automated accounts without the `[bot]` suffix.
 
 ---
 
 ## Example queries
 
-Register the Gold tables as views, then use Spark SQL:
+**Local (Spark SQL).** Register the Gold tables as views first:
 
 ```python
 # PYTHONPATH=src uv run python
@@ -379,11 +512,19 @@ SELECT event_date, is_bot, merged_prs_with_times,
        ROUND(p50_hours * 60, 1) AS median_minutes, ROUND(p75_hours, 2) AS p75_hours
 FROM pr_merge_time_daily
 ORDER BY event_date, is_bot;
+```
 
--- 4. Most active languages by human-opened PRs (Era A)
-SELECT language, SUM(pr_opened_human_events) AS human_prs_opened
-FROM language_activity_daily
-WHERE is_known_language
+**Athena** (through the views):
+
+```sql
+-- Weekday-matched bot share across eras
+SELECT era_label, weekday, total_events, ROUND(bot_share, 3) AS bot_share
+FROM octopulse.v_matched_weekdays
+ORDER BY weekday_num, era_label;
+
+-- Most active languages by human-opened PRs (Era A)
+SELECT language, SUM(human_prs_opened) AS human_prs_opened
+FROM octopulse.v_language_human_prs
 GROUP BY language
 ORDER BY human_prs_opened DESC
 LIMIT 10;
@@ -399,6 +540,13 @@ octopulse-lakehouse/
 ├── pyproject.toml
 ├── config/
 │   └── known_bots.csv               # optional list of automated accounts (header: login)
+├── infra/
+│   └── octopulse-serving-layer.yaml # CloudFormation: bucket, Athena workgroup, Glue tables
+├── sql/
+│   └── athena_views.sql             # semantic-layer views for Athena
+├── dashboards/                      # exported Superset dashboard
+├── docs/
+│   └── images/dashboard.png         # dashboard screenshot
 ├── scripts/
 │   ├── m0_feasibility.py            # sampling script used to compare the two eras
 │   ├── run_bronze.py                # --days supported; refuses partial days
@@ -452,7 +600,10 @@ octopulse-lakehouse/
 - **"New contributor" is relative to the loaded days** and decays as the window grows.
 - **Time to merge** describes PRs merged on a given day, not PRs opened on that day, and exists only in Era A.
 - **Timings are noisy** (single runs, up to about 2x variance on unchanged code).
-- **Local mode only.** No cluster was used; at this size a single-node engine would also cope. Spark was chosen to practise distributed-processing design and because the same code scales out.
+- **Local compute only.** No cluster was used; at this size a single-node engine would also cope. Spark was chosen to practise distributed-processing design, and because the same code scales out.
+- **The cloud layer serves Gold only.** Silver, Bronze and raw data exist locally; publishing is a manual step, and new Athena partitions need `MSCK REPAIR TABLE`.
+- **The dashboard is not publicly hosted.** Superset runs locally, so reviewers see screenshots and the exported definition rather than a live dashboard. Each chart load runs Athena queries (10 MB minimum each), which is cents, but a public deployment would need caching and access control.
+- **AWS plans can lapse.** The serving layer is deliberately rebuildable from the template, and the repository does not depend on a live account.
 - **Privacy.** Era A push payloads contain commit author emails. They stay in the local Bronze payload strings only; Silver and Gold never extract them. Do not publish `data/`.
 - **Licence.** No explicit data licence was found for GH Archive; the repository publishes code and aggregates only.
 
@@ -461,11 +612,12 @@ octopulse-lakehouse/
 ## Roadmap
 
 1. **Performance study:** controlled benchmarks (idle machine, repeated runs), a shuffle-partition sweep, AQE on/off, and skew experiments on `actor_id` (the real hot key) including a salted two-stage aggregation; record file counts and sizes.
-2. **Presentation layer:** a notebook rendering 6–8 charts from the Gold tables, plus saved SQL under `sql/`.
-3. **More data (if downloads allow):** 2025-08-12 (Tuesday) would add a third matched weekday and six consecutive Era A days; Era B Friday to Sunday would allow a 3-day velocity window and weekend comparisons.
-4. **Era B validation:** sample `closed` PRs against the GitHub REST API.
-5. **Behavioural bot flag:** mark actors above a daily event threshold.
-6. **Convenience:** a Makefile and CLI wrapper, `config/pipeline.yaml`, and optionally Delta Lake for `MERGE`-based upserts or an orchestrator.
+2. **Public presentation:** a static report (for example on GitHub Pages) generated from the Gold tables, so reviewers can see the findings without running Superset.
+3. **Automation:** a scheduled GitHub Actions workflow authenticating to AWS with OIDC (no stored keys), computing daily base tables, with history-dependent metrics (velocity, new-contributor flags) moved into Athena views so the runner can stay stateless.
+4. **More data (if downloads allow):** 2025-08-12 (Tuesday) would add a third matched weekday and six consecutive Era A days; Era B Friday to Sunday would allow a 3-day velocity window and weekend comparisons.
+5. **Era B validation:** sample `closed` PRs against the GitHub REST API.
+6. **Behavioural bot flag:** mark actors above a daily event threshold.
+7. **Convenience:** a Makefile and CLI wrapper, `config/pipeline.yaml`, and optionally Delta Lake for `MERGE`-based upserts.
 
 ---
 
@@ -476,3 +628,8 @@ octopulse-lakehouse/
 - GitHub changelog, 2025-08-08, upcoming Events API payload changes: <https://github.blog/changelog/2025-08-08-upcoming-changes-to-github-events-api-payloads/>
 - Community reports on the payload changes: [#177111](https://github.com/orgs/community/discussions/177111) (`commits` removed from `PushEvent`), [#177735](https://github.com/orgs/community/discussions/177735) (trimmed `pull_request` payloads). These are user reports, not official documentation; this project verified the effects on its own data.
 - Spark SQL performance tuning (AQE and skew handling): <https://spark.apache.org/docs/latest/sql-performance-tuning.html>
+- Amazon S3 pricing: <https://aws.amazon.com/s3/pricing/>
+- Amazon Athena pricing: <https://aws.amazon.com/athena/pricing/>
+- Athena per-query and per-workgroup data usage controls: <https://docs.aws.amazon.com/athena/latest/ug/workgroups-setting-control-limits-cloudwatch.html>
+- AWS Glue pricing (Data Catalog free tier): <https://aws.amazon.com/glue/pricing/>
+- Apache Superset quickstart: <https://superset.apache.org/user-docs/quickstart/>
